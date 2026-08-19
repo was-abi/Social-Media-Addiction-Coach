@@ -52,13 +52,15 @@ Addiction Coach takes a different path:
 ```
 User message → Streamlit UI
         ↓
-System prompt enforces CBT structure (one question at a time)
+Embed message, retrieve relevant CBT context (RAG over Chroma vector DB)
+        ↓
+System prompt enforces CBT structure + injects retrieved context
         ↓
 Llama 3.1 8B (via Hugging Face) generates coached response
         ↓
 Safety check: detect crisis language → redirect to 988 if needed
         ↓
-Response displayed in real-time chat
+Response displayed in real-time chat (interaction logged for RAG evaluation)
 ```
 
 The app maintains a chat history per session. Each AI response follows a strict pattern:
@@ -67,6 +69,47 @@ The app maintains a chat history per session. Each AI response follows a strict 
 3. Listen to the answer
 4. Suggest *one* specific tool (not a list)
 5. If crisis language detected → immediate redirect to 988 (US) or professional support
+
+---
+
+## Retrieval-Augmented Generation (RAG)
+
+The coach grounds its CBT advice in a real source text (`CBT_Book.pdf`) instead of relying purely on the LLM's own knowledge.
+
+### Pipeline
+
+1. **`load_pdf.py`** — extracts text from the PDF, splits it into sentence-aware overlapping chunks, embeds each chunk with `sentence-transformers/all-MiniLM-L6-v2`, and stores them in a **persistent** Chroma collection (`./chroma_db`) using **cosine distance**.
+2. **`app.py`** — on every user message, embeds the query and retrieves the top-k most relevant chunks from Chroma. Retrieved text is injected into the system prompt so the LLM's response is grounded in the source material rather than improvised.
+3. **`metrics.py` / `metrics_dashboard.py`** — every retrieval and response is logged to `rag_metrics.jsonl`, so retrieval quality can be inspected and measured rather than assumed.
+
+### Chunking
+
+Chunks are built by a custom sentence-aware splitter (`chunk_text()` in `load_pdf.py`):
+- Text is normalized (collapsed whitespace) before splitting.
+- Split on sentence boundaries — never cuts a sentence in half.
+- Target chunk size ~800 characters, packed greedily.
+- ~80 characters of overlap carried into the next chunk, so ideas spanning a chunk boundary aren't lost.
+
+This replaced an earlier version that hard-sliced the text every 500 characters regardless of sentence boundaries, which routinely split CBT technique explanations mid-sentence and hurt embedding quality.
+
+### Fixing the relevance metric (L2 vs. cosine)
+
+Chroma's default distance metric is **L2 (squared Euclidean)**, which is unbounded. Early metrics computed `relevance = 1 - distance`, a formula that's only valid for **cosine distance** (which is bounded to `[0, 2]`, and `1 - cosine_distance` recovers cosine similarity directly). Running that formula against L2 distances produced nonsensical negative "relevance" scores.
+
+Fix: the Chroma collection is now explicitly created with `metadata={"hnsw:space": "cosine"}` in both `load_pdf.py` and `app.py`, so distances returned by `collection.query()` are cosine distances and `1 - distance` is a correct similarity score (higher is better, roughly `0.0`–`1.0` for same-domain text).
+
+⚠️ Because distance space is fixed at collection creation, switching it requires deleting `./chroma_db` and re-running `load_pdf.py` — you can't convert an existing collection in place.
+
+### Evaluation Dashboard
+
+Run `streamlit run metrics_dashboard.py` to inspect retrieval quality:
+- Total queries, average relevance score, average chunks retrieved, average response length
+- Relevance trend over time (line chart)
+- Per-query breakdown: the exact chunks retrieved for each user message, ranked and color-coded by relevance (🟢 high / 🟡 medium / 🔴 low)
+- Response length metrics over time
+- Raw log download (JSONL)
+
+This lets you verify — with real numbers, not guesswork — whether the retrieval pipeline is actually surfacing relevant CBT content for a given user message, and how that changes as chunking or retrieval parameters are tuned.
 
 ---
 
