@@ -1,0 +1,1 @@
+timestamp,user_id,turn_num,user_query,retrieved_chunks,relevance_scores,context_used,ai_response,response_length,query_embedding_norm,chunk_distances

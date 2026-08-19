@@ -4,7 +4,59 @@ import streamlit as st
 from datetime import datetime
 from huggingface_hub import InferenceClient
 import uuid
+import chromadb
+from sentence_transformers import SentenceTransformer
+from metrics import RAGMetrics
 
+# Initialize Chroma (persistent, same path as load_pdf.py, cosine distance)
+client = chromadb.PersistentClient(path="./chroma_db")
+collection = client.get_or_create_collection(
+    name="addiction_coach_docs",
+    metadata={"hnsw:space": "cosine"}
+)
+
+# Load embedding model
+embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+
+# Initialize metrics
+metrics_logger = RAGMetrics()
+
+# Function to retrieve relevant PDF chunks
+def retrieve_context(user_message, top_k=3, user_id=None, turn_num=None):
+    """Search PDF for relevant chunks"""
+    try:
+        # Embed user message
+        query_embedding = embedding_model.encode(user_message)
+
+        # Search Chroma
+        results = collection.query(
+            query_embeddings=[query_embedding.tolist()],
+            n_results=top_k,
+            include=['documents', 'distances', 'embeddings']
+        )
+
+        # Log retrieval metrics
+        if user_id and turn_num is not None:
+            if results['documents'] and results['documents'][0]:
+                metrics_logger.log_retrieval(
+                    user_query=user_message,
+                    query_embedding=query_embedding,
+                    retrieved_chunks=results['documents'][0],
+                    retrieved_embeddings=results['embeddings'][0] if results['embeddings'] else [],
+                    distances=results['distances'][0] if results['distances'] else [],
+                    user_id=user_id,
+                    turn_num=turn_num
+                )
+
+        # Extract text from results
+        if results['documents']:
+            context = "\n\n".join(results['documents'][0])
+            return context, results['distances'][0] if results['distances'] else []
+        else:
+            return None, []
+    except Exception as e:
+        print(f"Error in retrieve_context: {e}")
+        return None, []
 # Load .env file
 load_dotenv()
 
@@ -169,25 +221,33 @@ if 'user_id' not in st.session_state:
     st.session_state.user_id = str(uuid.uuid4())[:8]
 
 # System prompt
-SYSTEM_PROMPT = """You are a compassionate digital wellness coach. Your tone is calm, empathetic, and never judgmental.
+SYSTEM_PROMPT = """You are a compassionate digital wellness coach trained in CBT (Cognitive Behavioral Therapy).
 
-Your job: Help someone who feels the urge to scroll understand WHY they want to scroll, and offer real solutions.
+Your tone: calm, empathetic, never judgmental.
+
+When responding, use CBT techniques from research:
+- Identify triggers (what emotion precedes the urge?)
+- Suggest behavioral activation (replace scrolling with real activity)
+- Use thought records (challenge unhelpful thoughts)
+- Practice exposure (sit with discomfort instead of scrolling)
+
+If you have relevant research context below, reference it naturally:
+"{context_placeholder}"
 
 IMPORTANT RULES:
 1. Always normalize their urge ("That's real, you're not weak")
-2. Ask ONE good question to find the trigger (loneliness? anxiety? boredom?)
-3. Listen to their answer carefully
-4. Suggest ONE specific tool (not a list)
-5. If they mention self-harm or suicide, respond with: "This is serious. Please call 988 (US) or talk to a professional immediately."
+2. Ask ONE good question to find the trigger
+3. Listen carefully to their answer
+4. Suggest ONE specific tool
+5. If self-harm/suicide mentioned: "This is serious. Call 988 immediately."
 
 WHEN THEY SAY THEY SCROLLED AGAIN:
 - Never say "you failed"
 - Say: "Okay. No judgment. Let's figure out what triggered it."
-- Treat it as information, not failure
+- Treat as data, not failure
 
-START CONVERSATION:
-If this is the first message, ask: "Hi. What's going on right now? Do you feel the urge to scroll?"
-Then listen and help them understand what they really need."""
+START: Ask "Hi. What's going on right now? Do you feel the urge to scroll?"
+"""
 
 # Display chat history (no white container)
 for message in st.session_state.messages:
@@ -210,12 +270,25 @@ if user_input:
         st.write(user_input)
         st.caption(datetime.now().strftime("%I:%M %p"))
     
+    # Retrieve relevant PDF context with metrics
+    turn_num = len(st.session_state.messages) // 2
+    context, distances = retrieve_context(
+        user_input,
+        top_k=3,
+        user_id=st.session_state.user_id,
+        turn_num=turn_num
+    )
+    context_text = f"Research context:\n{context}" if context else "No relevant research found."
+    
+    # Modify system prompt with context
+    system_with_context = SYSTEM_PROMPT.replace("{context_placeholder}", context_text)
+    
     # Call Hugging Face API
     try:
-        client = InferenceClient(api_key=HUGGINGFACE_API_KEY)
+        client_hf = InferenceClient(api_key=HUGGINGFACE_API_KEY)
         
         # Format messages for the API
-        messages_for_api = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages_for_api = [{"role": "system", "content": system_with_context}]
         for msg in st.session_state.messages[:-1]:
             messages_for_api.append({
                 "role": msg['role'],
@@ -227,7 +300,7 @@ if user_input:
         })
         
         # Get response from Hugging Face
-        response = client.chat_completion(
+        response = client_hf.chat_completion(
             model="meta-llama/Llama-3.1-8B-Instruct",
             messages=messages_for_api,
             max_tokens=500,
@@ -235,22 +308,29 @@ if user_input:
         )
         
         ai_response = response.choices[0].message.content
-        
+
+        # Log response metrics
+        metrics_logger.log_response(
+            user_id=st.session_state.user_id,
+            turn_num=turn_num,
+            ai_response=ai_response
+        )
+
         # Add AI response to history
         st.session_state.messages.append({
             'role': 'assistant',
             'content': ai_response,
             'timestamp': datetime.now().strftime("%I:%M %p")
         })
-        
+
         # Display AI response
         with st.chat_message("assistant", avatar="🧠"):
             st.write(ai_response)
             st.caption(datetime.now().strftime("%I:%M %p"))
-        
+
         # Rerun to refresh UI
         st.rerun()
-    
+
     except Exception as e:
         st.error(f"Error: {e}")
         st.info("Make sure your Hugging Face API token is correct in the .env file.")

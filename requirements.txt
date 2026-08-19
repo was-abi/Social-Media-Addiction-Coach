@@ -4,3 +4,7 @@ requests
 transformers
 torch
 python-dotenv
+chromadb
+pypdf
+sentence-transformers
+torchvision
